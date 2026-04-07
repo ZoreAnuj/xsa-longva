@@ -236,6 +236,29 @@ def evaluate(args):
             print(f"  [{idx}] gt={gt_letter} pred={pred_letter or '?'} "
                   f"resp={response[:60]!r}")
 
+        # Free per-iteration tensors to prevent VRAM growth.
+        # Without this, KV cache + image embeddings accumulate and OOM
+        # the H100 within ~30 min on a 1337-question run.
+        del input_ids, images, output_ids
+        if "frames" in locals():
+            del frames
+        if (idx + 1) % 25 == 0:
+            torch.cuda.empty_cache()
+
+        # Periodic checkpoint of partial results so we don't lose everything
+        # if a later question crashes.
+        if (idx + 1) % 100 == 0:
+            partial = {
+                "args": vars(args),
+                "in_progress": True,
+                "completed": len(results),
+                "correct": correct,
+                "total": total,
+                "results": results,
+            }
+            with open(args.output, "w") as _f:
+                json.dump(partial, _f)
+
         pbar.set_postfix({
             "acc": f"{(correct / max(total, 1)) * 100:.1f}%",
             "n": total,
