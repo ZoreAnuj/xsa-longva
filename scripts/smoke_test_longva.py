@@ -101,8 +101,13 @@ def main(args):
     # ----------------------------------------------------------------
     step(4, "Capturing baseline vision feature on dummy frames")
     # ----------------------------------------------------------------
-    # 4 dummy frames at 336x336
-    dummy_frames = [torch.randn(3, 336, 336) for _ in range(4)]
+    # 4 dummy frames at 336x336 — use uint8 numpy arrays in [0,255] since the
+    # HF CLIP image_processor expects PIL-convertible inputs.
+    import numpy as np
+    dummy_frames = [
+        (np.random.rand(336, 336, 3) * 255).astype(np.uint8)
+        for _ in range(4)
+    ]
     images = image_processor.preprocess(dummy_frames, return_tensors="pt")["pixel_values"]
     # Match the model's actual dtype (LongVA's builder forces fp16)
     model_dtype = next(model.parameters()).dtype
