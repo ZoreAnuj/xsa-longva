@@ -201,8 +201,11 @@ def evaluate(args):
                 max_new_tokens=8,
                 temperature=0.0,
             )
+            # LongVA's generate returns ONLY the newly generated tokens
+            # (the input prefix is replaced by visual feature embeddings),
+            # so decode the entire output, not output_ids[input_len:].
             response = tokenizer.decode(
-                output_ids[0, input_ids.shape[1]:], skip_special_tokens=True
+                output_ids[0], skip_special_tokens=True
             )
             pred_letter = parse_answer(response)
         except Exception as e:
