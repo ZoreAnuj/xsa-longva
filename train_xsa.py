@@ -336,9 +336,13 @@ def main(args: TrainArgs):
     # ----------------------------------------------------------------
     print("[load] LoRA adapters on the LLM")
     # ----------------------------------------------------------------
-    from peft import LoraConfig, get_peft_model, TaskType
+    # Use inject_adapter_in_model so LoRA layers replace the originals
+    # in-place without wrapping in a PeftModel. PeftModel wrapping breaks
+    # LlavaQwenForCausalLM's forward signature (it would route labels into
+    # the inner Qwen2Model which doesn't accept them).
+    from peft import LoraConfig, inject_adapter_in_model
 
-    # Freeze base LLM weights; LoRA will add trainable adapters
+    # Freeze base weights first
     for p in model.parameters():
         p.requires_grad = False
 
@@ -349,12 +353,13 @@ def main(args: TrainArgs):
         bias="none",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                         "gate_proj", "up_proj", "down_proj"],
-        task_type=TaskType.CAUSAL_LM,
     )
-    # Apply LoRA only to the LLM part
-    model.model = get_peft_model(model.model, lora_config)
+    # Inject adapters in-place — modifies model.model layers, doesn't wrap.
+    # We pass model.model so target_modules only match Qwen2 layers, not the
+    # vision tower's CLIPAttention (which also has q_proj/k_proj/v_proj/out_proj).
+    inject_adapter_in_model(lora_config, model.model)
 
-    # Re-enable training on vision tower (LoRA wrapping froze it)
+    # Re-enable training on vision tower (was frozen above)
     for p in vt.parameters():
         p.requires_grad = True
 
