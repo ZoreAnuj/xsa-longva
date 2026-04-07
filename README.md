@@ -131,11 +131,11 @@ The paper's biggest empirical finding: **gains scale with sequence length**. Lon
 
 ## Hardware
 
-**Designed for:** 1× H100 80GB (RunPod ~$3/h)  
+**Designed for:** 1× H100 80GB  
 **Training time:** 10-14 hours  
-**Total cost:** ~$50-80 (end-to-end including eval)
+**Total VRAM needed:** ~50GB (with bf16, gradient checkpointing, DeepSpeed ZeRO-3)
 
-Should also run on 1× A100 80GB with minor config changes. Won't fit on RTX 5090 for full FT due to 32GB VRAM — would require aggressive quantization.
+Should also run on 1× A100 80GB with minor config changes. Won't fit on a 32GB GPU for full FT — would require aggressive quantization.
 
 ## Status
 

@@ -1593,7 +1593,7 @@ git push -u origin main
 
 ---
 
-## Execution Timeline (H100 from RunPod)
+## Execution Timeline (H100 80GB)
 
 | Phase | Time | Action |
 |---|---|---|
@@ -1608,7 +1608,6 @@ git push -u origin main
 | Day 2 PM | 2h | README + publish |
 
 **Total H100 hours:** ~16-20h (training) + ~4h (eval) = ~20-24 H100 hours
-**RunPod cost estimate:** ~$50-80 (H100 80GB PCIe at ~$3/h)
 
 ## Success Criteria
 
