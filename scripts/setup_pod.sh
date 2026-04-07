@@ -22,9 +22,9 @@ echo "============================================"
 echo "[2/5] Installing core ML deps into system Python"
 echo "============================================"
 # Drop the numpy pin — torch 2.8 already brought numpy 2.x and we don't
-# need a specific version. Use --no-deps for transformers/peft to avoid
-# dragging in torch downgrade attempts.
-pip install --no-cache-dir \
+# need a specific version. --break-system-packages overrides PEP 668 (the
+# container is ephemeral, system Python is fine to modify).
+pip install --no-cache-dir --break-system-packages \
     "transformers==4.43.4" \
     "tokenizers>=0.19,<0.20" \
     "accelerate==0.33.0" \
