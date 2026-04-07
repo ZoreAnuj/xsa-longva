@@ -326,6 +326,13 @@ def main(args: TrainArgs):
         attn_implementation="sdpa",
     )
 
+    # Convert model from fp16 (LongVA's builder hardcodes it) to bf16.
+    # bf16 has the same exponent range as fp32, which prevents the
+    # XSA projection from overflowing in long sequences. fp16 NaNs out
+    # when v.norm() is small relative to (y*v).sum().
+    print("[load] converting model fp16 -> bf16")
+    model = model.to(dtype=torch.bfloat16)
+
     vt = model.get_vision_tower().vision_tower
     patch_clip_model_with_xsa(vt, use_xsa=True)
     print(f"[load] XSA layers: {count_xsa_layers(vt)}")
@@ -436,9 +443,9 @@ def main(args: TrainArgs):
             input_ids = batch["input_ids"].to("cuda:0")
             attention_mask = batch["attention_mask"].to("cuda:0")
             labels = batch["labels"].to("cuda:0")
-            images = [im.to("cuda:0", dtype=torch.float16) for im in batch["images"]]
+            images = [im.to("cuda:0", dtype=torch.bfloat16) for im in batch["images"]]
 
-            with torch.amp.autocast("cuda", dtype=torch.float16):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
