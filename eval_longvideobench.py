@@ -229,6 +229,10 @@ def evaluate(args):
             "correct": is_correct,
         })
 
+        if args.verbose or idx < 3:
+            print(f"  [{idx}] gt={gt_letter} pred={pred_letter or '?'} "
+                  f"resp={response[:60]!r}")
+
         pbar.set_postfix({
             "acc": f"{(correct / max(total, 1)) * 100:.1f}%",
             "n": total,
@@ -246,7 +250,7 @@ def evaluate(args):
     for r in results:
         g = r.get("duration_group", "unknown")
         groups.setdefault(g, [0, 0])
-        if r["pred"] >= 0:
+        if r["pred"]:  # non-empty letter means we parsed an answer
             groups[g][1] += 1
             if r["correct"]:
                 groups[g][0] += 1
@@ -295,5 +299,6 @@ if __name__ == "__main__":
     parser.add_argument("--xsa-ckpt", default=None, help="XSA fine-tuned vision tower dir")
     parser.add_argument("--max-frames", type=int, default=64)
     parser.add_argument("--limit", type=int, default=0, help="Eval first N (0 = all)")
+    parser.add_argument("--verbose", action="store_true", help="Print every response")
     args = parser.parse_args()
     evaluate(args)
