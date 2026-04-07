@@ -67,12 +67,15 @@ def main(args):
     # ----------------------------------------------------------------
     step(2, "Loading LongVA-7B-DPO (this takes a minute)")
     # ----------------------------------------------------------------
+    # Note: LongVA's builder hardcodes torch_dtype=float16 when not using
+    # 4/8-bit quantization, so we get fp16 here regardless. Also force
+    # sdpa instead of flash_attention_2 since we haven't built flash-attn.
     tokenizer, model, image_processor, _ = load_pretrained_model(
         ckpt_path,
         None,
         "llava_qwen",
         device_map="cuda:0",
-        torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa",
     )
     print(f"OK: model class = {type(model).__name__}")
     print(f"    total params = {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
@@ -101,7 +104,10 @@ def main(args):
     # 4 dummy frames at 336x336
     dummy_frames = [torch.randn(3, 336, 336) for _ in range(4)]
     images = image_processor.preprocess(dummy_frames, return_tensors="pt")["pixel_values"]
-    images = images.to(device, dtype=torch.bfloat16)
+    # Match the model's actual dtype (LongVA's builder forces fp16)
+    model_dtype = next(model.parameters()).dtype
+    print(f"model dtype: {model_dtype}")
+    images = images.to(device, dtype=model_dtype)
     print(f"images shape: {images.shape}, dtype: {images.dtype}")
 
     with torch.no_grad():
