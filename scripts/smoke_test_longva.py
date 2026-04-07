@@ -32,6 +32,7 @@ sys.path.insert(0, str(REPO_ROOT / "LongVA" / "longva"))
 import torch  # noqa: E402
 
 from patch_longva import patch_clip_model_with_xsa, count_xsa_layers  # noqa: E402
+from longva_helpers import load_longva  # noqa: E402
 
 
 def step(n, msg):
@@ -54,31 +55,28 @@ def main(args):
     print(f"Checkpoint: {ckpt_path}")
 
     # ----------------------------------------------------------------
-    step(1, "Importing LongVA")
+    step(1, "Loading LongVA-7B-DPO with meta tensor fix (1-2 min)")
     # ----------------------------------------------------------------
-    try:
-        from longva.model.builder import load_pretrained_model
-        print("OK: from longva.model.builder import load_pretrained_model")
-    except ImportError as e:
-        print(f"FAIL: cannot import LongVA: {e}")
-        print("Make sure LongVA/ submodule is cloned at the repo root.")
-        sys.exit(1)
-
-    # ----------------------------------------------------------------
-    step(2, "Loading LongVA-7B-DPO (this takes a minute)")
-    # ----------------------------------------------------------------
-    # Note: LongVA's builder hardcodes torch_dtype=float16 when not using
-    # 4/8-bit quantization, so we get fp16 here regardless. Also force
-    # sdpa instead of flash_attention_2 since we haven't built flash-attn.
-    tokenizer, model, image_processor, _ = load_pretrained_model(
+    tokenizer, model, image_processor, _ = load_longva(
         ckpt_path,
-        None,
-        "llava_qwen",
         device_map="cuda:0",
         attn_implementation="sdpa",
     )
     print(f"OK: model class = {type(model).__name__}")
     print(f"    total params = {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
+
+    # ----------------------------------------------------------------
+    step(2, "Verifying no meta tensors remain")
+    # ----------------------------------------------------------------
+    meta_count = sum(1 for p in model.parameters() if p.device.type == "meta")
+    print(f"meta tensor parameters: {meta_count}")
+    if meta_count > 0:
+        print("FAIL: model still has meta tensors after fix")
+        for name, p in model.named_parameters():
+            if p.device.type == "meta":
+                print(f"  meta: {name}")
+        sys.exit(1)
+    print("OK: all parameters materialized")
 
     # ----------------------------------------------------------------
     step(3, "Inspecting vision tower")
