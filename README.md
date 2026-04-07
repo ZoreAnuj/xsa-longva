@@ -85,18 +85,24 @@ python eval_longvideobench.py \
     --use-xsa
 ```
 
-## Target Results
+## Results
 
 Base model: `lmms-lab/LongVA-7B-DPO`  
-Benchmark: LongVideoBench val split (1,337 questions with ground truth)
+Benchmark: LongVideoBench val split (1,337 questions, public ground truth)  
+Hardware: 1× H100 80GB  
+Training subset: 5,000 video-instruction samples drawn from LLaVA-Video-178K (30-60s + 1-2m buckets), 16 frames per video, 2 epochs
 
-| Model | Overall | 8-15s | 15-60s | 3-10min | 15-60min |
-|-------|:---:|:---:|:---:|:---:|:---:|
-| LongVA-7B-DPO (SA baseline) | ~57% | - | - | - | - |
-| **XSA-LongVA-7B (ours)** | **≥60%** | - | - | - | - |
-| LLaVA-Video-7B-Qwen2 (current open SOTA) | 62.7% | - | - | - | - |
+| Model | Overall | Setup |
+|---|---:|---|
+| LongVA-7B-DPO (SA baseline, fp16, 32 frames) | **52.80%** | as published builder loads it |
+| LongVA-7B + XSA (ours, bf16, 32 frames eval) | _TBD after training_ | 24 CLIP layers patched, ~10h fine-tune |
+| LLaVA-Video-7B-Qwen2 (open 7B SOTA, 128 frames) | 62.7%¹ | reference target |
 
-**Hypothesis:** XSA gains concentrate on the longer duration buckets (15-60min) where temporal redundancy is most extreme and sequence length is longest.
+¹ from the official LongVideoBench leaderboard.
+
+**Note on baseline:** Our 52.80% is below LongVA's published mid-50s val score because LongVA's `load_pretrained_model` hardcodes fp16 (we lose ~2 pts vs bf16) and we evaluate at 32 frames instead of 64-128. **What matters is the delta** between this baseline and the XSA-trained variant — both run with the same loader and same frame budget, so the comparison is apples-to-apples.
+
+**Hypothesis being tested:** XSA's published gains scale with sequence length. LongVA's vision tower over 16-32 frames produces ~2300-4600 visual tokens — well into the regime where the XSA paper showed improvements on language modelling. If the same effect transfers to video understanding, the XSA-tuned vision tower should beat the SA baseline on LongVideoBench.
 
 ## Repository Structure
 
