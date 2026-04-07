@@ -23,9 +23,11 @@ import sys
 from pathlib import Path
 
 # Add repo root and the LongVA submodule to PYTHONPATH so we can import both.
+# LongVA's actual package is at LongVA/longva/longva/, so the importable
+# parent directory is LongVA/longva/.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(REPO_ROOT / "LongVA"))
+sys.path.insert(0, str(REPO_ROOT / "LongVA" / "longva"))
 
 import torch  # noqa: E402
 
