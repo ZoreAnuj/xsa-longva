@@ -86,6 +86,9 @@ def evaluate(args):
     from longva.mm_utils import tokenizer_image_token
     from longvideobench import LongVideoBenchDataset
 
+    # Create output directory upfront so periodic checkpoint saves don't crash
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+
     # ----------------------------------------------------------------
     # Load model
     # ----------------------------------------------------------------
