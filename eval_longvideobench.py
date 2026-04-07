@@ -47,24 +47,36 @@ from patch_longva import patch_clip_model_with_xsa, count_xsa_layers  # noqa: E4
 OPTION_LETTERS = ["A", "B", "C", "D", "E"]
 
 
-def build_prompt(question: str, options: list, subtitles: str = "") -> str:
-    """Format a LongVideoBench question as a multiple-choice prompt."""
-    opts = "\n".join(f"{OPTION_LETTERS[i]}. {o}" for i, o in enumerate(options))
-    sub_block = f"Subtitles:\n{subtitles}\n\n" if subtitles else ""
-    return (
-        f"{sub_block}{question}\n{opts}\n"
-        f"Answer with the option letter only."
-    )
+def split_inputs(inputs_list: list) -> tuple[list, str]:
+    """LongVideoBench returns an interleaved list of PIL Images (sampled
+    video frames) and str chunks (interleaved subtitles + question + options
+    + final instruction). We split into (frames, prompt_text).
+
+    The text chunks are concatenated in order with newlines between them.
+    For each PIL image we insert a placeholder line so the model can see
+    that frames are interleaved with the subtitles temporally — but for
+    LongVA we just concatenate all the frames at the start (the LongVA
+    chat template does not natively support per-frame text interleaving).
+    """
+    frames = []
+    text_parts = []
+    for x in inputs_list:
+        if hasattr(x, "size"):  # PIL Image
+            frames.append(x)
+        elif isinstance(x, str):
+            text_parts.append(x)
+        # silently ignore other types
+    full_text = "\n".join(text_parts)
+    return frames, full_text
 
 
-def parse_answer(text: str, num_options: int) -> int:
-    """Extract the chosen option index from the model's free-form output."""
+def parse_answer(text: str) -> str:
+    """Extract A/B/C/D/E from the model's free-form output."""
     text = text.strip().upper()
-    # Look for the first occurrence of A/B/C/D/E within the first ~10 chars
-    for i, letter in enumerate(OPTION_LETTERS[:num_options]):
+    for letter in OPTION_LETTERS:
         if letter in text[:8]:
-            return i
-    return -1  # could not parse
+            return letter
+    return ""  # could not parse
 
 
 @torch.no_grad()
@@ -144,24 +156,24 @@ def evaluate(args):
             errors += 1
             continue
 
-        # LongVideoBench item structure (from longvideobench package):
-        #   item["inputs"]    -> list of PIL Images (sampled video frames)
-        #   item["question"]  -> str
-        #   item["candidates"]-> list[str] options
-        #   item["correct_choice"] -> int index
-        #   item["subtitles"] -> optional str
-        #   item["duration_group"] -> bucket name
-        frames = item.get("inputs") or item.get("frames")
-        question = item["question"]
-        options = item["candidates"]
-        gt_idx = item["correct_choice"]
-        subtitles = item.get("subtitles", "") or ""
+        # LongVideoBench item structure:
+        #   item["inputs"]    -> interleaved list of PIL Images and str chunks
+        #   item["correct_choice"] -> letter "A".."E"
+        #   item["id"]        -> str
+        frames, text_block = split_inputs(item["inputs"])
+        gt_letter = item["correct_choice"].strip().upper()
 
-        full_question = build_prompt(question, options, subtitles)
+        if not frames:
+            errors += 1
+            continue
 
-        # Tokenize prompt with the LongVA conversation template
+        # Tokenize prompt with the LongVA conversation template, prepending
+        # a single <image> placeholder (LongVA inserts all frames at this
+        # position). The text_block already contains the question + options
+        # + final "Answer with the option letter" instruction from the
+        # LongVideoBench dataset.
         prompt = (
-            f"<|im_start|>user\n<image>\n{full_question}"
+            f"<|im_start|>user\n<image>\n{text_block}"
             f"<|im_end|>\n<|im_start|>assistant\n"
         )
         input_ids = tokenizer_image_token(
@@ -192,27 +204,27 @@ def evaluate(args):
             response = tokenizer.decode(
                 output_ids[0, input_ids.shape[1]:], skip_special_tokens=True
             )
-            pred_idx = parse_answer(response, len(options))
+            pred_letter = parse_answer(response)
         except Exception as e:
             print(f"[eval] generate failed for idx {idx}: {e}")
             traceback.print_exc()
             errors += 1
             continue
 
-        if pred_idx < 0:
+        if not pred_letter:
             parse_failures += 1
             is_correct = False
         else:
             total += 1
-            is_correct = pred_idx == gt_idx
+            is_correct = pred_letter == gt_letter
             if is_correct:
                 correct += 1
 
         results.append({
-            "id": item.get("id", idx),
+            "id": item.get("id", str(idx)),
             "duration_group": item.get("duration_group", "unknown"),
-            "gt": gt_idx,
-            "pred": pred_idx,
+            "gt": gt_letter,
+            "pred": pred_letter,
             "response": response,
             "correct": is_correct,
         })
