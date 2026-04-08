@@ -100,6 +100,14 @@ def evaluate(args):
     )
 
     if args.mode in ("xsa-zero", "xsa-tuned"):
+        # Training was done in bf16. Convert the entire model so the
+        # XSA-trained vision tower weights (also bf16) load with matching
+        # dtypes. Without this we get "mat1 and mat2 must have the same
+        # dtype" errors at forward time.
+        if args.mode == "xsa-tuned":
+            print("[load] converting model fp16 -> bf16 to match training dtype")
+            model = model.to(dtype=torch.bfloat16)
+
         vt = model.get_vision_tower().vision_tower
         patch_clip_model_with_xsa(vt, use_xsa=True)
         n_xsa = count_xsa_layers(vt)
@@ -116,6 +124,8 @@ def evaluate(args):
             print(f"[load] ERROR: vision_tower_xsa.safetensors not in {args.xsa_ckpt}")
             sys.exit(1)
         sd = load_file(st_path, device="cuda:0")
+        # Force bf16 (training dtype). vt is already bf16 after the cast above.
+        sd = {k: v.to(dtype=torch.bfloat16) for k, v in sd.items()}
         missing, unexpected = vt.load_state_dict(sd, strict=False, assign=True)
         print(f"[load] fine-tuned vision tower loaded "
               f"(missing={len(missing)}, unexpected={len(unexpected)})")
