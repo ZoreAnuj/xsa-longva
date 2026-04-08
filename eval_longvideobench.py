@@ -117,18 +117,33 @@ def evaluate(args):
         if not args.xsa_ckpt or not os.path.isdir(args.xsa_ckpt):
             print(f"[load] ERROR: --xsa-ckpt required for mode=xsa-tuned")
             sys.exit(1)
-        # Load fine-tuned vision tower weights
+        # Load fine-tuned vision tower weights. Prefer the LoRA-merged
+        # version if it exists (clean key names), otherwise fall back to
+        # the raw save (which has LoRA-wrapped key names — won't work
+        # without re-injecting LoRA, see scripts/merge_lora_into_vision_tower.py).
         from safetensors.torch import load_file
-        st_path = os.path.join(args.xsa_ckpt, "vision_tower_xsa.safetensors")
-        if not os.path.isfile(st_path):
-            print(f"[load] ERROR: vision_tower_xsa.safetensors not in {args.xsa_ckpt}")
+        merged = os.path.join(args.xsa_ckpt, "vision_tower_xsa_merged.safetensors")
+        raw = os.path.join(args.xsa_ckpt, "vision_tower_xsa.safetensors")
+        if os.path.isfile(merged):
+            st_path = merged
+            print("[load] using LoRA-merged vision tower checkpoint")
+        elif os.path.isfile(raw):
+            st_path = raw
+            print("[load] WARN: using raw vision tower checkpoint - "
+                  "may have LoRA-wrapped keys. Run scripts/merge_lora_into_vision_tower.py first.")
+        else:
+            print(f"[load] ERROR: no vision_tower_xsa*.safetensors in {args.xsa_ckpt}")
             sys.exit(1)
         sd = load_file(st_path, device="cuda:0")
-        # Force bf16 (training dtype). vt is already bf16 after the cast above.
         sd = {k: v.to(dtype=torch.bfloat16) for k, v in sd.items()}
         missing, unexpected = vt.load_state_dict(sd, strict=False, assign=True)
-        print(f"[load] fine-tuned vision tower loaded "
+        print(f"[load] vision tower loaded "
               f"(missing={len(missing)}, unexpected={len(unexpected)})")
+        # Sanity check: if everything is unexpected, the load did nothing
+        if len(unexpected) > len(sd) * 0.5:
+            print("[load] WARN: most of the saved keys are 'unexpected' - "
+                  "this means the trained weights did NOT replace the base.")
+            print("[load]       eval will measure the BASE vision tower, not your trained model.")
 
     model.eval()
     model_dtype = next(model.parameters()).dtype
