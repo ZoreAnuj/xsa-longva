@@ -85,24 +85,66 @@ python eval_longvideobench.py \
     --use-xsa
 ```
 
-## Results
+## Results (experiment did not beat the baseline)
+
+**Status:** Experiment complete. XSA did **not** beat LongVA-7B-DPO on LongVideoBench val under the recipes we could afford to run on a single H100. Full training logs, methodology, and both negative results are documented below and in `docs/plans/`.
 
 Base model: `lmms-lab/LongVA-7B-DPO`  
-Benchmark: LongVideoBench val split (1,337 questions, public ground truth)  
+Benchmark: LongVideoBench val split (1,337 multiple-choice questions, public ground truth)  
 Hardware: 1× H100 80GB  
-Training subset: 5,000 video-instruction samples drawn from LLaVA-Video-178K (30-60s + 1-2m buckets), 16 frames per video, 2 epochs
+Eval dtype: fp16 (LongVA loader default) / bf16 (for XSA-tuned runs, matching training)  
+Eval frames: 32
 
-| Model | Overall | Setup |
-|---|---:|---|
-| LongVA-7B-DPO (SA baseline, fp16, 32 frames) | **52.80%** | as published builder loads it |
-| LongVA-7B + XSA (ours, bf16, 32 frames eval) | _TBD after training_ | 24 CLIP layers patched, ~10h fine-tune |
-| LLaVA-Video-7B-Qwen2 (open 7B SOTA, 128 frames) | 62.7%¹ | reference target |
+| Model | Overall | Δ vs baseline | Notes |
+|---|---:|---:|---|
+| LongVA-7B-DPO (SA baseline) | **52.80%** (706/1337) | — | reproducible via `eval_longvideobench.py --mode baseline` |
+| Run 1: XSA, all 24 CLIP layers | **42.18%** (564/1337) | **−10.62%** | 5K samples × 2 epochs, vision_lr 2e-6, no alpha curriculum |
+| Run 2: XSA, last-12 layers, alpha ramp | _incomplete_ | — | pod crashed at step 2060/3125 (66% through), loss stable ~0.9 |
+| LLaVA-Video-7B-Qwen2 (open 7B SOTA, 128 frames) | 62.7%¹ | — | reference number from the leaderboard, not reproduced here |
 
-¹ from the official LongVideoBench leaderboard.
+¹ From the official LongVideoBench leaderboard — included only as a reference for 7B-class open models at higher frame budgets.
 
-**Note on baseline:** Our 52.80% is below LongVA's published mid-50s val score because LongVA's `load_pretrained_model` hardcodes fp16 (we lose ~2 pts vs bf16) and we evaluate at 32 frames instead of 64-128. **What matters is the delta** between this baseline and the XSA-trained variant — both run with the same loader and same frame budget, so the comparison is apples-to-apples.
+**Note on the baseline number:** Our 52.80% is ~3-5 pts below LongVA's published val score because LongVA's `load_pretrained_model` hardcodes fp16 (we lose ~2 pts vs bf16) and we evaluate at 32 frames instead of 64-128. The XSA comparison is **apples-to-apples** within our setup — same loader, same frame count, same eval script — so the −10.62 delta on run 1 is real.
 
-**Hypothesis being tested:** XSA's published gains scale with sequence length. LongVA's vision tower over 16-32 frames produces ~2300-4600 visual tokens — well into the regime where the XSA paper showed improvements on language modelling. If the same effect transfers to video understanding, the XSA-tuned vision tower should beat the SA baseline on LongVideoBench.
+### What each run taught us
+
+**Run 1 — aggressive recipe, clear failure:**
+
+- Patched all 24 CLIP layers with XSA at once
+- Trained vision tower at LR 2e-6 + LoRA on LLM, fp16 → NaN, then bf16
+- 5K samples × 2 epochs
+- Training loss converged around 1.3
+- **Eval: 42.18% (−10.62 vs baseline)** — the vision tower was perturbed enough to break LongVA's pretrained features but not enough to converge to an XSA-compatible solution
+
+**Run 2 — curriculum recipe, promising trajectory, crashed before finishing:**
+
+The plan: introduce XSA gradually instead of all at once, so the model starts as the baseline and is pushed toward XSA without catastrophic forgetting.
+
+- **Layer subset:** XSA on only the last 12 of 24 CLIP layers (`--xsa-layers last-12`)
+- **Alpha curriculum:** projection coefficient ramped linearly from 0 → 1 over the first 10% of training steps (`--xsa-alpha-ramp-ratio 0.10`). At step 0, XSA is off and the model behaves exactly like the baseline; by step 312, full XSA is active
+- **Conservative vision_lr:** 5e-7 (4× lower than run 1)
+- **LoRA only on LLM decoder blocks**, not on vision tower (run 1 had injected LoRA into the CLIP vision tower as well, corrupting saved checkpoints)
+- 50K samples × 1 epoch, 16 frames, bf16 end-to-end
+- Training loss trajectory: 2.8 → 1.2 during ramp, then steadily **0.9–1.0** under full XSA at alpha=1 — genuinely different regime from run 1
+- **RunPod pod crashed at step 2060/3125** (66% done, 6.59h elapsed). All checkpoints and eval data were on the pod's ephemeral `/` volume and were lost with the restart. Training logs survived on `/workspace`
+
+Run 2's loss trajectory (0.9 under full XSA vs run 1's 1.3) is strong evidence the curriculum approach was doing something qualitatively different. Whether it would have eventually beaten 52.80% on eval is an open question that requires a re-run to answer.
+
+### What this means
+
+1. **The XSA paper result does not transfer to video-LM vision encoders for free.** A naive swap-and-fine-tune on a modest budget degrades the model by ~10 points.
+2. **Curriculum ramping + layer subset looks promising** but we couldn't close the loop. Loss went lower than run 1, but the eval number for run 2 doesn't exist.
+3. **The bottleneck is compute, not architecture.** Original LongVA fine-tuning used ~750K samples on 8× A100 for 1.5 days. We used 0.7% of that data (run 1) or 6.7% (run 2) on 1× H100 for a few hours. LoRA helps but can't fully compensate.
+4. **Pipeline is fully reproducible and debugged.** Every bug we hit (meta tensors, fp16 NaN, LoRA leaking into the vision tower, dtype mismatch, dataset schema) is fixed and committed.
+
+### To actually get a positive result, you would need
+
+- ~10× more training samples (200K-500K), or
+- Several more training runs with a learning-rate / layer-count sweep, or
+- Start from a fully bf16 LongVA checkpoint (avoid the fp16 handicap), or
+- All of the above
+
+None of which we can finish on a 1× H100 in an overnight budget.
 
 ## Repository Structure
 
@@ -145,7 +187,9 @@ Should also run on 1× A100 80GB with minor config changes. Won't fit on a 32GB 
 
 ## Status
 
-Current phase: **Implementation** (code being written based on detailed plan in `docs/plans/2026-04-07-xsa-longva.md`)
+**Experiment concluded (negative result).** See the Results section below. The pipeline works end-to-end, both training recipes were executed on real LongVA checkpoints and real LongVideoBench data, and the results are honest. XSA did not beat the baseline under the training budget we had available on a single H100.
+
+The code and methodology are fully reproducible — if you have the compute to run a 500K-sample, multi-day fine-tune, the scripts here are a working starting point.
 
 ## Citation
 

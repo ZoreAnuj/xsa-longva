@@ -1,8 +1,16 @@
 # XSA-LongVA: Exclusive Self Attention for Long Video Understanding
 
+> **Final status (2026-04-08):** Experiment concluded. XSA did **not** beat the
+> LongVA-7B-DPO baseline on LongVideoBench val under the two recipes we ran on
+> a single H100. Run 1 produced **42.18%** vs baseline **52.80%** (−10.62%).
+> Run 2 (curriculum + layer subset) crashed with the pod at step 2060/3125
+> (66% through) before we could eval. Training logs survived; checkpoints did
+> not. See `README.md` for the full results breakdown. The plan below is
+> preserved for methodological reference.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Apply Exclusive Self Attention (XSA) to LongVA's CLIP ViT-L/14 vision encoder, fine-tune with a video instruction dataset on a single H100 (or RTX 5090), and beat LongVA-7B-DPO baseline on LongVideoBench validation by +2 or more points.
+**Goal (original):** Apply Exclusive Self Attention (XSA) to LongVA's CLIP ViT-L/14 vision encoder, fine-tune with a video instruction dataset on a single H100 (or RTX 5090), and beat LongVA-7B-DPO baseline on LongVideoBench validation by +2 or more points.
 
 **Architecture:** Start from `lmms-lab/LongVA-7B-DPO`. Replace `CLIPAttention` in all 24 layers of the vision tower with `XSACLIPAttention` that adds an orthogonal projection removing the self-value component. Fine-tune the modified vision tower fully (LR 2e-6) plus LoRA adapters on the Qwen2-7B LLM (rank 16) on a subset of LLaVA-Video-178K (30-60s bucket, ~100K samples). Evaluate on LongVideoBench val split (1,337 questions with GT).
 
