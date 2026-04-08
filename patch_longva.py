@@ -14,7 +14,8 @@ Typical usage::
     patch_clip_model_with_xsa(model, use_xsa=True)
 """
 
-from typing import List, Tuple
+import re
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -28,7 +29,14 @@ __all__ = [
     "patch_clip_model_with_xsa",
     "count_xsa_layers",
     "freeze_non_xsa_parameters",
+    "set_xsa_alpha",
 ]
+
+
+# CLIP layer paths look like:
+#   vision_model.encoder.layers.22.self_attn
+# We extract the integer layer index so callers can select a subset.
+_CLIP_LAYER_IDX_RE = re.compile(r"encoder\.layers\.(\d+)\.self_attn")
 
 
 def _copy_clip_attn_weights(src: CLIPAttention, dst: XSACLIPAttention) -> None:
@@ -52,8 +60,10 @@ def patch_clip_model_with_xsa(
     model: nn.Module,
     use_xsa: bool = True,
     xsa_eps: float = 1e-6,
+    xsa_alpha: float = 1.0,
+    only_layer_indices: Optional[Iterable[int]] = None,
 ) -> nn.Module:
-    """Replace every ``CLIPAttention`` in ``model`` with ``XSACLIPAttention``.
+    """Replace ``CLIPAttention`` layers in ``model`` with ``XSACLIPAttention``.
 
     Walks ``model``'s module tree, constructs a new :class:`XSACLIPAttention`
     for each HF ``CLIPAttention`` child it finds, copies over the pretrained
@@ -66,42 +76,90 @@ def patch_clip_model_with_xsa(
             self-component projection. If ``False``, they behave like vanilla
             attention -- useful as an A/B ablation control.
         xsa_eps: Numerical stabilizer passed to each new ``XSACLIPAttention``.
+        xsa_alpha: Initial value of the projection scaling factor. 0 means
+            the XSA modules start as plain attention; 1 means full XSA from
+            the first forward pass.
+        only_layer_indices: If provided, only CLIP encoder layers whose index
+            is in this set will be patched. Layer index is parsed from the
+            module name ``...encoder.layers.<i>.self_attn``. This lets callers
+            run experiments with XSA applied to, e.g., just the last 12 of 24
+            layers.
 
     Returns:
         The same ``model`` instance (modified in place).
 
     Raises:
-        RuntimeError: If no ``CLIPAttention`` layers were found in ``model``.
+        RuntimeError: If no ``CLIPAttention`` layers were found in ``model``,
+            or if a layer filter was provided and no layer matched.
     """
+    if only_layer_indices is not None:
+        selected = set(int(i) for i in only_layer_indices)
+    else:
+        selected = None
+
     # Collect replacement targets first so we don't mutate the module tree
-    # while iterating over it.
-    to_replace: List[Tuple[nn.Module, str, CLIPAttention]] = []
-    for parent in model.modules():
+    # while iterating over it. We need the full dotted name of each parent
+    # so we can parse out the encoder layer index and apply the filter.
+    to_replace: List[Tuple[nn.Module, str, CLIPAttention, Optional[int]]] = []
+    for parent_name, parent in model.named_modules():
         for child_name, child in parent.named_children():
-            if isinstance(child, CLIPAttention):
-                to_replace.append((parent, child_name, child))
+            if not isinstance(child, CLIPAttention):
+                continue
+            full_name = f"{parent_name}.{child_name}" if parent_name else child_name
+            m = _CLIP_LAYER_IDX_RE.search(full_name)
+            layer_idx = int(m.group(1)) if m else None
+            if selected is not None and (layer_idx is None or layer_idx not in selected):
+                continue
+            to_replace.append((parent, child_name, child, layer_idx))
 
     if not to_replace:
         raise RuntimeError(
-            "patch_clip_model_with_xsa: no CLIPAttention layers were found in "
-            "the given model. Check that you passed a CLIPVisionModel (or a "
-            "wrapper containing one) and not, e.g., the vision tower object."
+            "patch_clip_model_with_xsa: no CLIPAttention layers were matched. "
+            "Check that you passed a CLIPVisionModel (or a wrapper containing "
+            "one) and that any `only_layer_indices` filter actually matches "
+            "the layer numbering."
         )
 
-    for parent, child_name, child in to_replace:
+    for parent, child_name, child, _layer_idx in to_replace:
         ref_weight = child.q_proj.weight
         new_attn = XSACLIPAttention(
             child.config,
             use_xsa=use_xsa,
             xsa_eps=xsa_eps,
+            xsa_alpha=xsa_alpha,
         ).to(dtype=ref_weight.dtype, device=ref_weight.device)
         _copy_clip_attn_weights(child, new_attn)
         setattr(parent, child_name, new_attn)
 
-    print(
-        f"[patch_longva] Replaced {len(to_replace)} CLIPAttention layers with XSA"
-    )
+    if selected is None:
+        print(
+            f"[patch_longva] Replaced {len(to_replace)} CLIPAttention layers with XSA"
+        )
+    else:
+        patched_indices = sorted(
+            {int(_CLIP_LAYER_IDX_RE.search(n).group(1))
+             for n, _ in model.named_modules() if _CLIP_LAYER_IDX_RE.search(n) and
+             isinstance(dict(model.named_modules())[n], XSACLIPAttention)}
+        )
+        print(
+            f"[patch_longva] Replaced {len(to_replace)} CLIPAttention layers "
+            f"with XSA (layer subset; indices={patched_indices})"
+        )
     return model
+
+
+def set_xsa_alpha(model: nn.Module, alpha: float) -> int:
+    """Set the ``xsa_alpha`` buffer on every :class:`XSACLIPAttention` in ``model``.
+
+    Returns the number of modules that were updated.
+    """
+    n = 0
+    with torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, XSACLIPAttention):
+                module.xsa_alpha.fill_(float(alpha))
+                n += 1
+    return n
 
 
 def count_xsa_layers(model: nn.Module) -> int:

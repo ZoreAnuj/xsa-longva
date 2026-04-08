@@ -44,7 +44,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -58,8 +58,32 @@ from longva_helpers import load_longva  # noqa: E402
 from patch_longva import (  # noqa: E402
     patch_clip_model_with_xsa,
     count_xsa_layers,
+    set_xsa_alpha,
 )
 from xsa_clip_attention import XSACLIPAttention  # noqa: E402
+
+
+def _parse_xsa_layers(spec: str, total: int) -> Optional[set]:
+    """Parse a user-supplied layer selection string for CLIP's encoder.layers.
+
+    Accepted forms:
+        "all"       -> None (patch every layer)
+        "last-N"    -> {total-N, ..., total-1}
+        "A-B"       -> {A, A+1, ..., B} (inclusive)
+        "A,B,C"     -> {A, B, C}
+    """
+    if not spec or spec.lower() == "all":
+        return None
+    s = spec.strip().lower()
+    if s.startswith("last-"):
+        n = int(s[5:])
+        return set(range(max(0, total - n), total))
+    if "," in s:
+        return {int(x) for x in s.split(",") if x.strip()}
+    if "-" in s:
+        lo, hi = s.split("-", 1)
+        return set(range(int(lo), int(hi) + 1))
+    return {int(s)}
 
 
 # ----------------------------------------------------------------------------
@@ -78,7 +102,7 @@ class TrainArgs:
     num_epochs: int = 1
     max_steps: int = -1
     lr: float = 1e-5
-    vision_lr: float = 2e-6
+    vision_lr: float = 5e-7
     weight_decay: float = 0.0
     warmup_ratio: float = 0.03
     lora_r: int = 16
@@ -91,6 +115,11 @@ class TrainArgs:
     max_seq_len: int = 8192
     image_size: int = 336
     train_xsa_only: bool = False  # ablation: freeze vision tower except XSA params
+    # XSA-specific knobs added for Option C training
+    xsa_layers: str = "all"  # "all" | "last-N" | "A-B" (inclusive range)
+    xsa_alpha_ramp_ratio: float = 0.10  # ramp 0->1 over first N% of steps
+    xsa_alpha_start: float = 0.0
+    xsa_alpha_end: float = 1.0
 
 
 class VideoInstructionDataset(Dataset):
@@ -334,8 +363,20 @@ def main(args: TrainArgs):
     model = model.to(dtype=torch.bfloat16)
 
     vt = model.get_vision_tower().vision_tower
-    patch_clip_model_with_xsa(vt, use_xsa=True)
-    print(f"[load] XSA layers: {count_xsa_layers(vt)}")
+
+    # Parse --xsa-layers into a set of layer indices (or None for all).
+    num_clip_layers = len(vt.vision_model.encoder.layers)
+    xsa_layer_indices = _parse_xsa_layers(args.xsa_layers, num_clip_layers)
+    patch_clip_model_with_xsa(
+        vt,
+        use_xsa=True,
+        xsa_alpha=args.xsa_alpha_start,  # start ramped down
+        only_layer_indices=xsa_layer_indices,
+    )
+    print(
+        f"[load] XSA layers: {count_xsa_layers(vt)} of {num_clip_layers} "
+        f"(selection={args.xsa_layers}, alpha_start={args.xsa_alpha_start})"
+    )
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -361,10 +402,13 @@ def main(args: TrainArgs):
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                         "gate_proj", "up_proj", "down_proj"],
     )
-    # Inject adapters in-place — modifies model.model layers, doesn't wrap.
-    # We pass model.model so target_modules only match Qwen2 layers, not the
-    # vision tower's CLIPAttention (which also has q_proj/k_proj/v_proj/out_proj).
-    inject_adapter_in_model(lora_config, model.model)
+    # Inject adapters in-place. CRITICAL: passing model.model also walks into
+    # model.model.vision_tower, matches CLIP's q/k/v_proj, and adds LoRA to
+    # the vision tower as well — which is what happened in run 1 and caused
+    # the state_dict save/load to produce LoRA-wrapped keys that eval
+    # couldn't load cleanly. We target model.model.layers directly so only
+    # the Qwen2 decoder blocks get adapters.
+    inject_adapter_in_model(lora_config, model.model.layers)
 
     # Re-enable training on vision tower (was frozen above)
     for p in vt.parameters():
@@ -435,6 +479,23 @@ def main(args: TrainArgs):
     running_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
 
+    # XSA alpha ramp schedule: linearly interpolate from xsa_alpha_start to
+    # xsa_alpha_end over the first `xsa_alpha_ramp_ratio * total_steps` steps,
+    # then hold at xsa_alpha_end. Gives the model a curriculum where the
+    # initial steps look like the baseline (alpha=0) and XSA kicks in
+    # gradually.
+    alpha_ramp_steps = max(1, int(args.xsa_alpha_ramp_ratio * total_steps))
+    def _alpha_at(step: int) -> float:
+        if step >= alpha_ramp_steps:
+            return args.xsa_alpha_end
+        t = step / alpha_ramp_steps
+        return args.xsa_alpha_start + t * (args.xsa_alpha_end - args.xsa_alpha_start)
+
+    # Apply the initial alpha before the first forward pass.
+    n_alpha = set_xsa_alpha(vt, _alpha_at(0))
+    print(f"[train] XSA alpha ramp {args.xsa_alpha_start}->{args.xsa_alpha_end} "
+          f"over first {alpha_ramp_steps} steps ({n_alpha} modules)")
+
     for epoch in range(args.num_epochs):
         for batch in loader:
             if batch is None:
@@ -468,6 +529,10 @@ def main(args: TrainArgs):
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
+                # Update XSA alpha before the next forward pass
+                current_alpha = _alpha_at(global_step)
+                set_xsa_alpha(vt, current_alpha)
+
                 if global_step % args.log_steps == 0:
                     elapsed = time.time() - start
                     log = {
@@ -476,11 +541,13 @@ def main(args: TrainArgs):
                         "loss": running_loss / args.log_steps,
                         "lr_other": scheduler.get_last_lr()[1],
                         "lr_vision": scheduler.get_last_lr()[0],
+                        "xsa_alpha": current_alpha,
                         "elapsed_h": elapsed / 3600,
                     }
                     print(
                         f"[step {global_step:>6d}] loss={log['loss']:.4f} "
                         f"lr={log['lr_other']:.2e}/{log['lr_vision']:.2e} "
+                        f"alpha={current_alpha:.3f} "
                         f"elapsed={log['elapsed_h']:.2f}h"
                     )
                     with open(log_file, "a") as f:
@@ -552,6 +619,14 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, default=336)
     parser.add_argument("--train-xsa-only", action="store_true",
                         help="Freeze vision tower except XSA params (ablation)")
+    parser.add_argument("--xsa-layers", type=str, default="all",
+                        help='Which CLIP layers to patch with XSA. '
+                             'Examples: "all", "last-12", "12-23", "18,19,20,21,22,23"')
+    parser.add_argument("--xsa-alpha-ramp-ratio", type=float, default=0.10,
+                        help="Fraction of total optimizer steps over which to "
+                             "ramp XSA alpha from start to end.")
+    parser.add_argument("--xsa-alpha-start", type=float, default=0.0)
+    parser.add_argument("--xsa-alpha-end", type=float, default=1.0)
     parsed = parser.parse_args()
     args = TrainArgs(**vars(parsed))
     main(args)

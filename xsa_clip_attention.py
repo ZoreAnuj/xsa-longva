@@ -32,6 +32,11 @@ class XSACLIPAttention(nn.Module):
         config: A ``CLIPVisionConfig`` or ``CLIPTextConfig``.
         use_xsa: If True (default), apply the XSA self-component projection.
         xsa_eps: Numerical stabilizer for the XSA denominator.
+        xsa_alpha: Scalar in [0, 1] that multiplies the projection coefficient.
+            Allows curriculum-style warmup: at alpha=0 this module is exactly
+            the standard attention (nothing subtracted), at alpha=1 it's full
+            XSA, and intermediate values interpolate. Stored as a buffer so
+            it moves with the module and can be mutated at runtime.
     """
 
     def __init__(
@@ -39,6 +44,7 @@ class XSACLIPAttention(nn.Module):
         config: Union[CLIPVisionConfig, CLIPTextConfig],
         use_xsa: bool = True,
         xsa_eps: float = 1e-6,
+        xsa_alpha: float = 1.0,
     ) -> None:
         super().__init__()
         self.config = config
@@ -62,6 +68,14 @@ class XSACLIPAttention(nn.Module):
         # XSA-specific options.
         self.use_xsa = use_xsa
         self.xsa_eps = xsa_eps
+        # Register xsa_alpha as a buffer so (a) it's part of the module state
+        # and moves with .to(device), (b) callers can mutate it at runtime
+        # (e.g. during warmup) without rebuilding the module.
+        self.register_buffer(
+            "xsa_alpha",
+            torch.tensor(float(xsa_alpha), dtype=torch.float32),
+            persistent=False,
+        )
 
     def forward(
         self,
@@ -121,11 +135,16 @@ class XSACLIPAttention(nn.Module):
         )
 
         # XSA: project out the component of y aligned with each token's own v.
+        # xsa_alpha allows curriculum-style warmup: alpha=0 leaves attention
+        # unchanged, alpha=1 is full XSA. The buffer is a 0-dim tensor, so we
+        # cast it to the activation dtype for the multiply.
         if self.use_xsa:
             coeff = (y * v).sum(-1, keepdim=True) / (
                 v.norm(dim=-1, keepdim=True) ** 2 + self.xsa_eps
             )
-            y = y - coeff * v
+            alpha = self.xsa_alpha.to(dtype=y.dtype)
+            if alpha.item() > 0:
+                y = y - alpha * coeff * v
 
         # (B, H, N, D) -> (B, N, H, D) -> (B, N, embed_dim)
         attn_output = y.transpose(1, 2).contiguous().reshape(bsz, tgt_len, embed_dim)
